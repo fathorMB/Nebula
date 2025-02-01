@@ -1,4 +1,6 @@
-﻿using System.Net;
+﻿using System;
+using System.Net;
+using System.Threading;
 
 namespace Nebula.Core
 {
@@ -6,26 +8,23 @@ namespace Nebula.Core
     {
         static void Main(string[] args)
         {
-            //if (args.Length < 1)
-            //{
-            //    Console.WriteLine("Utilizzo: PeerNode <porta> [bootstrap-server]");
-            //    return;
-            //}
+            int port = args.Length > 0 ? int.Parse(args[0]) : PortFinder.FindAvailablePortAuto();
+            IPEndPoint bootstrap = args.Length > 1 ? NetworkUtils.ParseEndPoint(args[1]) : null;
 
-            int availablePort = PortFinder.FindAvailablePortAuto();
+            try
+            {
+                using var node = new PeerNode(port, bootstrap);
+                node.Start();
+                Logger.LogInfo($"Node started on port {port}" +
+                    (bootstrap != null ? $" with bootstrap server {bootstrap}" : ""));
 
-            IPEndPoint bootstrap = args.Length > 1 ? ParseEndPoint(args[1]) : null;
-
-            using var node = new PeerNode(availablePort, bootstrap);
-            node.Start();
-
-            while (true) Thread.Sleep(1000); // Mantiene l'applicazione attiva
-        }
-
-        private static IPEndPoint ParseEndPoint(string endpoint)
-        {
-            string[] parts = endpoint.Split(':');
-            return new IPEndPoint(IPAddress.Parse(parts[0]), int.Parse(parts[1]));
+                while (true) Thread.Sleep(1000);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"Critical error: {ex}");
+                Environment.Exit(1);
+            }
         }
     }
 }

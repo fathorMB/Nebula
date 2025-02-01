@@ -22,14 +22,26 @@ namespace Nebula.Core
         public NetworkManager(int tcpPort, int udpPort)
         {
             this.tcpPort = tcpPort;
-            this.udpPort = udpPort;
+            this.udpPort = tcpPort; // Forza stessa porta per UDP
+            Logger.LogInfo($"Initialized NetworkManager TCP:{tcpPort} UDP:{udpPort}");
         }
 
+
+        // Modifica temporanea in NetworkManager.cs
         public void Start()
         {
-            isRunning = true;
-            StartTcpListener();
-            StartUdpListener();
+            try
+            {
+                Logger.LogInfo($"Starting TCP listener on {tcpPort} and UDP on {udpPort}");
+                isRunning = true;
+                StartTcpListener();
+                StartUdpListener();
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"Network startup failed: {ex}");
+                throw;
+            }
         }
 
         private void StartTcpListener()
@@ -52,20 +64,28 @@ namespace Nebula.Core
 
         private void StartUdpListener()
         {
-            udpClient = new UdpClient(udpPort);
-            new Thread(() =>
+            try
             {
-                while (isRunning)
+                udpClient = new UdpClient(udpPort);
+                Logger.LogInfo($"UDP listener started on port {udpPort}");
+                new Thread(() =>
                 {
-                    try
+                    while (isRunning)
                     {
-                        IPEndPoint remoteEP = new IPEndPoint(IPAddress.Any, 0);
-                        byte[] data = udpClient.Receive(ref remoteEP);
-                        UdpMessageReceived?.Invoke(new UdpReceiveResult(data, remoteEP));
+                        try
+                        {
+                            IPEndPoint remoteEP = new IPEndPoint(IPAddress.Any, 0);
+                            byte[] data = udpClient.Receive(ref remoteEP);
+                            UdpMessageReceived?.Invoke(new UdpReceiveResult(data, remoteEP));
+                        }
+                        catch { /* UDP listener error */ }
                     }
-                    catch { /* UDP listener error */ }
-                }
-            }).Start();
+                }).Start();
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"UDP listener failed: {ex}");
+            }
         }
 
         public void SendTcpMessage(NetworkStream stream, string message)

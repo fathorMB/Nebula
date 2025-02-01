@@ -1,14 +1,12 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Net.Sockets;
+using System.IO;
 using System.Net;
+using System.Net.Sockets;
 using System.Text;
-using System.Threading.Tasks;
+using System.Threading;
 
 namespace Nebula.Core
 {
-    // File: PeerNode.cs
     public class PeerNode : IDisposable
     {
         private readonly NetworkManager networkManager;
@@ -18,7 +16,7 @@ namespace Nebula.Core
 
         public PeerNode(int port, IPEndPoint bootstrapServer = null)
         {
-            networkManager = new NetworkManager(port, port + 1);
+            networkManager = new NetworkManager(port, port); // Modifica qui
             fileManager = new FileManager(port);
             peerDiscovery = new PeerDiscoveryService(networkManager, port, bootstrapServer);
 
@@ -41,15 +39,22 @@ namespace Nebula.Core
                 using (client)
                 using (var stream = client.GetStream())
                 {
-                    string message = networkManager.ReadTcpMessage(stream);
-                    ProcessTcpMessage(message, stream);
+                    try
+                    {
+                        string message = networkManager.ReadTcpMessage(stream);
+                        ProcessTcpMessage(message, stream);
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.LogError($"TCP connection error: {ex}");
+                    }
                 }
             });
         }
 
         private void ProcessTcpMessage(string message, NetworkStream stream)
         {
-            string[] parts = message.Split(':');
+            string[] parts = message.Split(':', 3);
             switch (parts[0])
             {
                 case "SEARCH":
@@ -57,7 +62,7 @@ namespace Nebula.Core
                     break;
 
                 case "REQUEST":
-                    HandleFileRequest(parts[1], stream);
+                    HandleFileRequest(parts[1], parts[2], stream);
                     break;
             }
         }
@@ -74,10 +79,11 @@ namespace Nebula.Core
             }
         }
 
-        private void HandleFileRequest(string fileId, NetworkStream stream)
+        private void HandleFileRequest(string fileId, string fileName, NetworkStream stream)
         {
             if (fileManager.TryGetFile(fileId, out string filePath))
             {
+                networkManager.SendTcpMessage(stream, $"START:{fileName}");
                 using var fileStream = File.OpenRead(filePath);
                 fileStream.CopyTo(stream);
             }
@@ -85,7 +91,7 @@ namespace Nebula.Core
 
         private void HandleUdpMessage(UdpReceiveResult message)
         {
-            // Gestione aggiuntiva messaggi UDP se necessario
+            peerDiscovery.HandleUdpMessage(message);
         }
 
         private void StartUserInterface()
@@ -94,11 +100,11 @@ namespace Nebula.Core
             {
                 while (isRunning)
                 {
-                    Console.WriteLine("\nComandi:");
-                    Console.WriteLine("add <file> - Condividi file");
-                    Console.WriteLine("search <id> - Cerca file");
-                    Console.WriteLine("peers - Lista peer");
-                    Console.WriteLine("exit - Esci");
+                    Console.WriteLine("\nCommands:");
+                    Console.WriteLine("add <file> - Share file");
+                    Console.WriteLine("search <term> - Search files");
+                    Console.WriteLine("peers - List known peers");
+                    Console.WriteLine("exit - Quit");
 
                     var input = Console.ReadLine()?.Split(' ');
                     if (input == null || input.Length < 1) continue;
@@ -123,7 +129,7 @@ namespace Nebula.Core
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"Errore: {ex.Message}");
+                        Logger.LogError($"Command error: {ex.Message}");
                     }
                 }
             }).Start();
@@ -131,36 +137,47 @@ namespace Nebula.Core
 
         private void HandleAddFile(string filePath)
         {
+            if (!File.Exists(filePath))
+            {
+                Logger.LogError("File not found");
+                return;
+            }
+
             string fileId = fileManager.AddFile(filePath);
-            Console.WriteLine($"File condiviso - ID: {fileId}");
+            Logger.LogInfo($"File shared - ID: {fileId}");
         }
 
-        private void HandleFileSearch(string fileId)
+        private void HandleFileSearch(string searchTerm)
         {
-            foreach (var peer in peerDiscovery.GetKnownPeers())
+            if (fileManager.TryGetMetadata(searchTerm, out var metadata))
             {
-                try
+                foreach (var peer in peerDiscovery.GetKnownPeers())
                 {
-                    using var client = new TcpClient();
-                    client.Connect(peer);
-                    using var stream = client.GetStream();
-
-                    networkManager.SendTcpMessage(stream, $"SEARCH:{fileId}");
-                    string response = networkManager.ReadTcpMessage(stream);
-
-                    if (response.StartsWith("FOUND"))
+                    try
                     {
-                        Console.WriteLine($"File trovato presso {peer}");
-                        DownloadFile(fileId, peer);
-                        return;
+                        using var client = new TcpClient();
+                        client.Connect(peer);
+                        using var stream = client.GetStream();
+
+                        networkManager.SendTcpMessage(stream, $"SEARCH:{metadata.FileId}");
+                        string response = networkManager.ReadTcpMessage(stream);
+
+                        if (response.StartsWith("FOUND"))
+                        {
+                            DownloadFile(metadata.FileId, metadata.FileName, peer);
+                            return;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.LogError($"Search error: {ex.Message}");
                     }
                 }
-                catch { /* Ignora peer non raggiungibile */ }
             }
-            Console.WriteLine("File non trovato");
+            Logger.LogInfo("File not found");
         }
 
-        private void DownloadFile(string fileId, IPEndPoint peer)
+        private void DownloadFile(string fileId, string fileName, IPEndPoint peer)
         {
             try
             {
@@ -168,20 +185,25 @@ namespace Nebula.Core
                 client.Connect(peer);
                 using var stream = client.GetStream();
 
-                networkManager.SendTcpMessage(stream, $"REQUEST:{fileId}");
-                fileManager.SaveDownloadedFile(fileId, stream);
+                networkManager.SendTcpMessage(stream, $"REQUEST:{fileId}:{fileName}");
+                string response = networkManager.ReadTcpMessage(stream);
 
-                Console.WriteLine($"File scaricato: {fileId}");
+                if (response.StartsWith("START"))
+                {
+                    string receivedFileName = response.Split(':')[1];
+                    fileManager.SaveDownloadedFile(fileId, receivedFileName, stream);
+                    Logger.LogInfo($"File downloaded: {receivedFileName}");
+                }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Download fallito: {ex.Message}");
+                Logger.LogError($"Download failed: {ex.Message}");
             }
         }
 
         private void ListKnownPeers()
         {
-            Console.WriteLine("Peer conosciuti:");
+            Logger.LogInfo("Known peers:");
             foreach (var peer in peerDiscovery.GetKnownPeers())
             {
                 Console.WriteLine(peer);

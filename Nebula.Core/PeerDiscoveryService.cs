@@ -1,17 +1,16 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Net.Sockets;
 using System.Net;
+using System.Net.Sockets;
 using System.Text;
-using System.Threading.Tasks;
 
 namespace Nebula.Core
 {
     public class PeerDiscoveryService
     {
         private readonly NetworkManager networkManager;
-        private readonly List<IPEndPoint> knownPeers = new List<IPEndPoint>();
+        private readonly Dictionary<IPEndPoint, DateTime> peerActivity = new Dictionary<IPEndPoint, DateTime>();
         private readonly IPEndPoint bootstrapServer;
         private readonly int tcpPort;
         private Timer peerMaintenanceTimer;
@@ -30,11 +29,23 @@ namespace Nebula.Core
             StartPeerMaintenance();
         }
 
+        // In PeerDiscoveryService.cs modifica:
         private void RegisterWithBootstrapServer()
         {
             if (bootstrapServer != null)
             {
-                networkManager.SendUdpMessage(bootstrapServer, $"REGISTER:{tcpPort}");
+                try
+                {
+                    Logger.LogInfo($"Registering with bootstrap server: {bootstrapServer}");
+                    networkManager.SendUdpMessage(bootstrapServer, $"REGISTER:{tcpPort}");
+
+                    // Aggiungi una richiesta PEERS immediata
+                    networkManager.SendUdpMessage(bootstrapServer, $"REQUEST_PEERS:{tcpPort}");
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogError($"Bootstrap registration failed: {ex}");
+                }
             }
         }
 
@@ -49,7 +60,7 @@ namespace Nebula.Core
 
         private void BroadcastPeerDiscovery()
         {
-            foreach (var peer in knownPeers.ToList())
+            foreach (var peer in peerActivity.Keys.ToList())
             {
                 networkManager.SendUdpMessage(peer, $"PING:{tcpPort}");
             }
@@ -57,54 +68,104 @@ namespace Nebula.Core
 
         private void RemoveInactivePeers()
         {
-            // Implementare logica di rimozione peer inattivi
+            lock (peerActivity)
+            {
+                var cutoff = DateTime.Now.AddMinutes(-5);
+                var inactive = peerActivity.Where(kvp => kvp.Value < cutoff).ToList();
+                foreach (var peer in inactive)
+                {
+                    peerActivity.Remove(peer.Key);
+                    Logger.LogInfo($"Removed inactive peer: {peer.Key}");
+                }
+            }
         }
 
-        private void HandleUdpMessage(UdpReceiveResult message)
+        // In PeerDiscoveryService.cs aggiorna:
+        public void HandleUdpMessage(UdpReceiveResult message)
         {
-            string[] parts = Encoding.UTF8.GetString(message.Buffer).Split(':');
-            switch (parts[0])
+            try
             {
-                case "PING":
-                    UpdatePeerList(new IPEndPoint(message.RemoteEndPoint.Address, int.Parse(parts[1])));
-                    break;
+                string msg = Encoding.UTF8.GetString(message.Buffer);
+                Logger.LogInfo($"Received UDP message: {msg} from {message.RemoteEndPoint}");
 
-                case "PEERS":
-                    UpdatePeerList(parts[1..].Select(ParseEndPoint).ToArray());
-                    break;
+                string[] parts = msg.Split(':');
+                var peerEndpoint = new IPEndPoint(message.RemoteEndPoint.Address, int.Parse(parts[1]));
 
-                case "REGISTER":
-                    var newPeer = new IPEndPoint(message.RemoteEndPoint.Address, int.Parse(parts[1]));
-                    UpdatePeerList(newPeer);
-                    break;
+                switch (parts[0])
+                {
+                    case "PING":
+                        Logger.LogInfo($"Processing PING from {peerEndpoint}");
+                        UpdatePeerList(peerEndpoint);
+                        break;
+
+                    case "PEERS":
+                        Logger.LogInfo($"Received PEERS list: {msg}");
+                        UpdatePeerList(parts[1..].Select(NetworkUtils.ParseEndPoint).ToArray());
+                        break;
+
+                    case "REGISTER":
+                        Logger.LogInfo($"New registration from {peerEndpoint}");
+                        UpdatePeerList(peerEndpoint);
+                        SendPeerList(message.RemoteEndPoint);
+                        break;
+
+                    case "REQUEST_PEERS":
+                        Logger.LogInfo($"Peer request from {peerEndpoint}");
+                        SendPeerList(message.RemoteEndPoint);
+                        break;
+                }
+
+                lock (peerActivity)
+                {
+                    peerActivity[peerEndpoint] = DateTime.Now;
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"Error handling UDP message: {ex}");
+            }
+        }
+
+        private void SendPeerList(IPEndPoint recipient)
+        {
+            try
+            {
+                var peers = GetKnownPeers()
+                    .Where(p => !p.Equals(recipient))
+                    .Select(p => $"{p.Address}:{p.Port}");
+
+                if (peers.Any())
+                {
+                    string peerList = string.Join(",", peers);
+                    networkManager.SendUdpMessage(recipient, $"PEERS:{peerList}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"Error sending peer list: {ex}");
             }
         }
 
         private void UpdatePeerList(params IPEndPoint[] peers)
         {
-            lock (knownPeers)
+            lock (peerActivity)
             {
                 foreach (var peer in peers)
                 {
-                    if (!knownPeers.Any(p => p.Equals(peer)) && peer.Port != tcpPort)
+                    if (!peerActivity.ContainsKey(peer) && peer.Port != tcpPort)
                     {
-                        knownPeers.Add(peer);
+                        peerActivity[peer] = DateTime.Now;
+                        Logger.LogInfo($"Added new peer: {peer}");
                     }
                 }
             }
         }
 
-        private IPEndPoint ParseEndPoint(string endpoint)
-        {
-            string[] parts = endpoint.Split(':');
-            return new IPEndPoint(IPAddress.Parse(parts[0]), int.Parse(parts[1]));
-        }
-
         public IPEndPoint[] GetKnownPeers()
         {
-            lock (knownPeers)
+            lock (peerActivity)
             {
-                return knownPeers.ToArray();
+                return peerActivity.Keys.ToArray();
             }
         }
     }
